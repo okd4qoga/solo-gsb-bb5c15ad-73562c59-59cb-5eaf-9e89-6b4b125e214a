@@ -192,12 +192,86 @@ class RequestRecord(BaseModel):
     epsilon_before: float
     epsilon_after: float
     created_at: datetime
+    # Set when this granted request has been reversed; the original verdict
+    # fields above are retained as the historical admission record.
+    reversed: bool = False
+    reversal_id: Optional[str] = None
+    reversal_reason: Optional[str] = None
+    reversed_at: Optional[datetime] = None
 
 
 class RequestList(BaseModel):
     dataset_id: str
     count: int
     requests: list[RequestRecord]
+
+
+# -------------------------------------------------------------- reversals --
+
+
+class ReversalCreate(BaseModel):
+    """Reverse a previously granted analysis request.
+
+    The original request record is retained unchanged; a separate immutable
+    reversal record moves the request out of the live RDP composition, freeing
+    its budget.
+    """
+
+    reversal_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["rev-20260924-0001"],
+        description="Client-generated idempotency key; globally unique.",
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        examples=["mistakenly submitted analysis"],
+        description="Why the granted request is being reversed; stored "
+        "immutably on the reversal record.",
+    )
+
+    @field_validator("reversal_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
+class ReversalView(BaseModel):
+    """Immutable record of one granted-request reversal.
+
+    ``epsilon_before`` / ``epsilon_after`` are the composed epsilon snapshots
+    at reversal time (target request still included vs. removed); the original
+    request's own verdict fields are never rewritten.  Replaying the same
+    ``reversal_id`` returns this stored record with
+    ``idempotent_replay = true`` without reversing again.
+    """
+
+    reversal_id: str
+    dataset_id: str
+    request_id: str
+    reason: str
+    epsilon: float
+    delta: float
+    epsilon_cap: float
+    epsilon_before: float
+    epsilon_after: float
+    epsilon_remaining: float
+    rdp_best_order: float
+    idempotent_replay: bool = False
+    created_at: datetime
+
+
+class ReversalList(BaseModel):
+    dataset_id: str
+    count: int
+    reversals: list[ReversalView]
 
 
 ReservationStatus = Literal[

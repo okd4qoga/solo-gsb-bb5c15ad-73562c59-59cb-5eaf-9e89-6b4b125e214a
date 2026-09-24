@@ -27,14 +27,34 @@ delta_cap 与已入账申请、预留均不变。来源转出后上限必须仍�
 上限均不变（拒绝也留痕）。相同 `transfer_id` + 相同负载重试返回原记录而不
 再次转拨，异负载返回 `409`。
 
+最后支持对**已授权分析申请的冲正（reversal）**：
+`POST /datasets/{dataset_id}/requests/{request_id}/reversals` 携带全局幂等键
+`reversal_id` 与原因，仅允许冲正**已授权且尚未冲正**的申请；冲正被拒绝的
+申请或对同一申请再次冲正返回 `409`。原申请裁定与「预留 → 确认」的历史
+记录**原样保留**，另写一条**不可变**冲正记录，并在同一个 SQLite 写事务内
+完成；冲正后该申请被移出 RDP 组合——预算查询、后续申请、预留确认、上限
+转拨与到期预测都按释放后的额度核算，而**仍然有效的预留继续计入**。相同
+`reversal_id` + 相同目标与原因重试返回原冲正记录（不重复释放），异负载
+`409`；原 `request_id` 同负载重试仍回放最初裁定、不重新占额。
+
 ---
 
 ## 1. 快速启动（Docker Compose）
 
-```bash
-# 构建并后台启动
-docker compose up -d --build
+**单条命令启动**（首次会自动构建镜像，SQLite 数据保存在命名卷中）：
 
+```bash
+docker compose up -d --build
+```
+
+启动后 API 地址为 **http://localhost:8000**（健康检查
+http://localhost:8000/health，交互式文档 http://localhost:8000/docs）。
+无需任何额外配置；必要的环境变量（数据库路径、端口、SQLite 超时、浮点
+容差）都已在 `docker-compose.yml` 中给出默认值，见下文第 3 节。
+
+其他常用命令：
+
+```bash
 # 查看日志
 docker compose logs -f
 
@@ -106,7 +126,10 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | `GET` | `/datasets/{dataset_id}` | 数据集信息 + 预算明细 |
 | `GET` | `/datasets/{dataset_id}/budget` | 仅预算明细（消耗 / 预留 / 剩余 / RDP 曲线） |
 | `POST` | `/datasets/{dataset_id}/requests` | 提交分析申请（幂等） |
-| `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected） |
+| `GET` | `/datasets/{dataset_id}/requests` | 全部申请记录（含 granted / rejected，并标明是否已冲正） |
+| `POST` | `/datasets/{dataset_id}/requests/{request_id}/reversals` | 冲正一条已授权且未冲正的申请（按 `reversal_id` 幂等） |
+| `GET` | `/datasets/{dataset_id}/reversals` | 数据集下全部冲正记录 |
+| `GET` | `/datasets/{dataset_id}/requests/{request_id}/reversals/{reversal_id}` | 查询单条冲正记录 |
 | `POST` | `/datasets/{dataset_id}/reservations` | 创建预算预留（幂等，带 TTL） |
 | `GET` | `/datasets/{dataset_id}/reservations` | 全部预留记录（含各生命周期状态与时间） |
 | `GET` | `/datasets/{dataset_id}/reservations/{reservation_id}` | 查询单个预留 |
@@ -519,6 +542,99 @@ epsilon_committed`（成功时为转拨后的新 cap，拒绝时为原 cap）。
 完成；并发转拨之间、转拨与申请 / 预留之间无论怎样交错，预算都不会透支
 （来源新 cap 永远覆盖其占用），且两端 epsilon_cap 之和守恒。
 
+### 4.13 冲正已授权申请（reversal）
+
+当一次已授权（直接 granted，或由预留 confirmed）的分析申请需要撤销时，可
+以对其发起**冲正**。冲正**不删除、不改写**原申请：`requests` 中的原始裁定
+（`epsilon_before` / `epsilon_after` / 时间戳）与预留的 `confirmed` 历史都
+原样保留；服务另写一条不可变冲正记录，并从冲正时刻起把该申请移出 RDP
+组合，释放其占用的预算。
+
+```bash
+curl -X POST \
+  http://localhost:8000/datasets/sales-2026/requests/req-20260923-0001/reversals \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "reversal_id": "rev-20260924-0001",
+    "reason": "duplicate analysis, mistaken submission"
+  }'
+```
+
+请求体：
+
+| 字段 | 类型 | 约束 |
+| --- | --- | --- |
+| `reversal_id` | string | 必填，客户端生成的**全局**幂等键（字母/数字/`.`/`_`/`-`，1–200） |
+| `reason` | string | 必填，1–2000 字符，冲正原因，随记录不可变保存 |
+
+成功返回 `201`：
+
+```json
+{
+  "reversal_id": "rev-20260924-0001",
+  "dataset_id": "sales-2026",
+  "request_id": "req-20260923-0001",
+  "reason": "duplicate analysis, mistaken submission",
+  "epsilon": 0.2,
+  "delta": 1e-8,
+  "epsilon_cap": 1.0,
+  "epsilon_before": 0.203936,
+  "epsilon_after": 0.0,
+  "epsilon_remaining": 1.0,
+  "rdp_best_order": 8192.0,
+  "idempotent_replay": false,
+  "created_at": "2026-09-24T09:00:00.000000+00:00"
+}
+```
+
+`epsilon_before` / `epsilon_after` 是冲正时点的组合 epsilon 快照（目标申请
+移除前 / 移除后），`epsilon_remaining = epsilon_cap − epsilon_after`；
+`epsilon` / `delta` 为被冲正申请自身的预算参数。冲正一条由预留确认而来的
+申请时，释放的是该申请占用的额度，预留行仍保持 `confirmed` 不变。
+
+状态与冲突语义：
+
+* 仅 **granted 且未冲正** 的申请可冲正；
+* 目标申请为 `rejected` → `409 request_not_granted`；
+* 目标申请**已冲正** → `409 request_already_reversed`（detail 中给出已有
+  冲正的 `reversal_id`）；
+* 数据集不存在 → `404 dataset_not_found`；申请不存在 →
+  `404 request_not_found`；
+* 负载非法（空 id / 非法字符 / 空原因等）→ `422`。
+
+幂等语义：
+
+* 相同 `reversal_id` + 相同目标（dataset/request）+ 相同原因重试：返回
+  `200` 与**首次的原始冲正记录**（含首次快照与 `created_at`），
+  `idempotent_replay=true`，预算只释放一次；
+* 相同 `reversal_id` 但目标申请或原因不同：返回
+  `409 reversal_id_conflict`，不产生任何变更；
+* 冲正后用原 `request_id` + 同负载重放 `POST /requests`：仍返回**最初的
+  裁定**（`idempotent_replay=true`），**不会**重新占用预算——历史裁定与
+  活预算口径分离。
+
+冲正后的核算口径（与既有路径完全一致，只是 granted 集合排除被冲正申请）：
+
+* `GET …/budget`、数据集信息：`epsilon_consumed` / `epsilon_remaining` /
+  `granted_requests` / `rdp_curve` 按释放后重算；
+* 后续 `POST …/requests` 与预留 `confirm`：在释放后的剩余额度上做准入；
+* **仍然有效的预留继续计入**（`epsilon_reserved` /
+  `active_reservations` 不受其他申请冲正影响）；
+* `POST /budget-transfers`：两端占用重算时排除被冲正申请；
+* `GET …/budget/release-forecast`：模拟基线的已授权申请集合同样排除被
+  冲正申请，只对预留到期做模拟。
+
+冲正记录查询：
+
+* `GET /datasets/{dataset_id}/reversals` → 按冲正发生顺序返回该数据集全部
+  冲正记录（字段同上，`idempotent_replay` 恒为 `false`）；
+* `GET /datasets/{dataset_id}/requests/{request_id}/reversals/{reversal_id}`
+  → 查询单条；`reversal_id` 不属于该申请 → `404 reversal_not_found`，申请
+  本身不存在 → `404 request_not_found`；
+* `GET …/requests` 列表中每条申请新增 `reversed`（bool）、`reversal_id`、
+  `reversal_reason`、`reversed_at` 字段；未冲正的申请这些字段为
+  `false` / `null`，原裁定字段保持为受理当时的历史值。
+
 ---
 
 ## 5. RDP 组合会计（核算口径）
@@ -542,12 +658,18 @@ epsilon_committed`（成功时为转拨后的新 cap，拒绝时为原 cap）。
 
 4. 准入判定：把**当前累计曲线 + 本次申请/预留**投影后得到 `ε_projected`，
    当且仅当 `ε_projected ≤ epsilon_cap + EPSILON_TOLERANCE` 时授权/锁定。
-   这里的「当前累计曲线」= 全部 `granted` 申请 ∪ 全部**未过期**
-   `granted` 预留；已释放/已过期预留不参与组合。
+   这里的「当前累计曲线」= 全部 `granted` 且**未冲正**的申请 ∪ 全部**未
+   过期** `granted` 预留；已释放/已过期预留与已冲正申请不参与组合（被冲正
+   申请的原始行仍保留在 `requests` 中，只是存在对应
+   `request_reversals` 行而被核算排除）。
 
 5. 确认（confirm）只是把同一条 `(ε, δ)` 从「预留集合」移到「已授权申请
    集合」：确认前后的组合曲线完全相同，因此不发生二次扣减；释放与过期
    则从组合中移除该条预留，额度立即/自动归还。
+
+6. 冲正（reversal）把一条已授权申请从「已授权申请集合」移除并另写不可变
+   冲正记录：所有读 / 写路径的 granted 集合都统一排除带冲正记录的申请，
+   原申请的历史 `epsilon_before` / `epsilon_after` 不被改写。
 
 特殊情形：
 
@@ -565,12 +687,17 @@ epsilon_committed`（成功时为转拨后的新 cap，拒绝时为原 cap）。
 
 ## 6. 并发与原子性
 
-* 每个写操作（登记、提交申请、创建/确认/释放预留、epsilon 上限转拨）在进程内
-  `asyncio.Lock` 保护下打开一个 SQLite **`BEGIN IMMEDIATE`** 事务：
-  「惰性过期清理 → 查重/查状态 → 重算（已授权申请 + 有效预留）组合消耗 →
-  判定 → 插入/更新记录」在同一个事务临界区内完成，并发操作被串行化，
-  **申请与预留无论怎样并发交错，已授权 + 有效预留的组合消耗都不会超过
-  cap**；
+* 每个写操作（登记、提交申请、创建/确认/释放预留、epsilon 上限转拨、
+  申请冲正）在进程内 `asyncio.Lock` 保护下打开一个 SQLite
+  **`BEGIN IMMEDIATE`** 事务：「惰性过期清理 → 查重/查状态 → 重算（未冲正
+  已授权申请 + 有效预留）组合消耗 → 判定 → 插入/更新记录」在同一个事务
+  临界区内完成，并发操作被串行化，**申请与预留无论怎样并发交错，已授权
+  （未冲正）+ 有效预留的组合消耗都不会超过 cap**；
+* 冲正事务在该临界区内一次完成「幂等键查重 → 目标申请状态校验 → 移除前/
+  移除后组合 epsilon 快照 → 写入不可变 request_reversals 记录」：冲正与
+  申请 / 预留 / 转拨并发交错时，额度的释放与重新占用始终一致，同一条申请
+  最多被冲正一次（`UNIQUE (dataset_id, request_id)` 兜底），同一
+  `reversal_id` 全局唯一；
 * 转拨事务在该临界区内一次完成「两端占用重算 → 正数/覆盖占用/不超 1000
   校验 → 两端 cap UPDATE → 写入 budget_transfers 记录」：校验失败时回滚
   （两个 cap 不变，仅留一条 rejected 记录），并发转拨与普通申请 / 预留
@@ -597,6 +724,7 @@ Schema 由 SQLite 的 `PRAGMA user_version` 管理，服务启动时自动顺序
 | 1 | `datasets`、`requests` 表（原始版本） |
 | 2 | 新增 `reservations` 表（含状态、TTL、`expires_at` / `expired_at` / `confirmed_at` / `released_at` 等时间列与部分索引） |
 | 3 | 新增 `budget_transfers` 表（全局唯一 `transfer_id`、来源/目标、金额、状态、两端 cap 转拨前后快照与占用、时间戳） |
+| 4 | 新增 `request_reversals` 表（全局唯一 `reversal_id`、目标申请、原因、冲正前后组合 epsilon 快照与时间戳；`(dataset_id, request_id)` 唯一）。已有 granted 申请在显式冲正前核算口径不变 |
 
 旧版本数据库（无 `user_version`，即 v0）启动时会先确保 v1 表存在再顺序升级
 到最新版本，已有数据集、申请与预留记录原样保留。
@@ -634,6 +762,17 @@ RDP 数学性质、幂等回放（含拒绝回放）、`request_id` 冲突 409�
 （含被拒重试）、异负载 409、40 路并发转拨恰好不使来源变负、20 路转拨与
 20 路普通申请混合并发不透支、20 路重复 `transfer_id` 并发仅一条记录，以及
 从 v2 schema 启动时自动迁移出 `budget_transfers` 表。
+
+冲正测试另覆盖：纯 ε / 近似 DP 冲正后预算按释放重算（并用 `rdp.py` 独立
+核算交叉校验）、原申请历史字段不变而列表标明冲正、释放额度可被新申请使用
+且原被拒申请重放仍回放原拒绝、冲正确认预留而来的申请释放额度且预留行保持
+confirmed、其他有效预留继续计入并仍能阻止超额新申请、到期预测与上限转拨
+的占用均反映释放、冲正 rejected 申请 / 二次冲正 / 申请缺失 / 数据集缺失 /
+非法负载的 409 与 404 与 422、相同 `reversal_id` 同负载重放返回原记录且
+只释放一次、异原因 / 异目标（含跨数据集全局键）409、原 `request_id` 同
+负载重放不重新占额、冲正记录列表与单条查询、20 路重复 `reversal_id` 并发
+仅一条记录、15 路不同 `reversal_id` 并发仅一条成功，以及从 v3 schema 启动
+时自动迁移出 `request_reversals` 表。
 
 ---
 

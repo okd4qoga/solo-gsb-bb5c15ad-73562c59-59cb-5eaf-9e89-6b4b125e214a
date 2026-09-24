@@ -18,6 +18,9 @@ from .schemas import (
     DatasetRegister,
     ReleaseForecast,
     RequestList,
+    ReversalCreate,
+    ReversalList,
+    ReversalView,
     ReservationConfirm,
     ReservationCreate,
     ReservationList,
@@ -44,6 +47,24 @@ RESERVATION_ID = Annotated[
         description="Client-chosen reservation identifier.",
     ),
 ]
+REQUEST_ID = Annotated[
+    str,
+    Path(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._\-]+$",
+        description="Client-chosen analysis request identifier.",
+    ),
+]
+REVERSAL_ID = Annotated[
+    str,
+    Path(
+        min_length=1,
+        max_length=200,
+        pattern=r"^[A-Za-z0-9._\-]+$",
+        description="Client-chosen reversal identifier.",
+    ),
+]
 
 
 @asynccontextmanager
@@ -54,7 +75,7 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(
     title="Differential-Privacy Budget Ledger",
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
     description=(
         "Register epsilon/delta caps per dataset and submit analysis "
@@ -70,7 +91,11 @@ app = FastAPI(
         "transferred between two registered datasets in one atomic, "
         "idempotent transaction: the source must stay positive and cover its "
         "current occupancy, the target may never exceed the registered cap "
-        "ceiling of 1000, and a rejected attempt leaves both caps unchanged."
+        "ceiling of 1000, and a rejected attempt leaves both caps unchanged.  "
+        "Finally, a granted analysis request can be reversed with a globally "
+        "unique reversal_id and reason: the original verdict and reservation "
+        "history stay untouched while an immutable reversal record removes "
+        "the request from live RDP composition, freeing its budget."
     ),
 )
 
@@ -165,6 +190,50 @@ async def _transfer_conflict(_: Request, exc: db.TransferConflict) -> JSONRespon
     )
 
 
+@app.exception_handler(db.RequestNotFound)
+async def _request_not_found(_: Request, exc: db.RequestNotFound) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": "request_not_found", "request_id": exc.args[0]},
+    )
+
+
+@app.exception_handler(db.ReversalNotFound)
+async def _reversal_not_found(_: Request, exc: db.ReversalNotFound) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_404_NOT_FOUND,
+        content={"error": "reversal_not_found", "reversal_id": exc.args[0]},
+    )
+
+
+@app.exception_handler(db.ReversalConflict)
+async def _reversal_conflict(_: Request, exc: db.ReversalConflict) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": "reversal_id_conflict",
+            "reversal_id": exc.args[0],
+            "detail": (
+                "reversal_id was already used for a different reversal "
+                "(target request or reason differs)"
+            ),
+        },
+    )
+
+
+@app.exception_handler(db.ReversalStateConflict)
+async def _reversal_state_conflict(
+    _: Request, exc: db.ReversalStateConflict
+) -> JSONResponse:
+    return JSONResponse(
+        status_code=status.HTTP_409_CONFLICT,
+        content={
+            "error": exc.args[0],
+            "detail": exc.args[1],
+        },
+    )
+
+
 @app.get("/health", tags=["meta"])
 async def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -239,6 +308,44 @@ async def submit_request(dataset_id: DATASET_ID, payload: AnalysisRequest):
 )
 async def get_requests(dataset_id: DATASET_ID) -> dict:
     return await ledger.list_requests(dataset_id)
+
+
+# --------------------------------------------------------------- reversals --
+
+
+@app.post(
+    "/datasets/{dataset_id}/requests/{request_id}/reversals",
+    response_model=ReversalView,
+    status_code=status.HTTP_201_CREATED,
+    tags=["reversals"],
+)
+async def create_reversal(
+    dataset_id: DATASET_ID, request_id: REQUEST_ID, payload: ReversalCreate
+):
+    view, http_status = await ledger.reverse_request(
+        dataset_id, request_id, payload
+    )
+    return JSONResponse(status_code=http_status, content=view)
+
+
+@app.get(
+    "/datasets/{dataset_id}/reversals",
+    response_model=ReversalList,
+    tags=["reversals"],
+)
+async def list_reversals(dataset_id: DATASET_ID) -> dict:
+    return await ledger.list_reversals(dataset_id)
+
+
+@app.get(
+    "/datasets/{dataset_id}/requests/{request_id}/reversals/{reversal_id}",
+    response_model=ReversalView,
+    tags=["reversals"],
+)
+async def get_reversal(
+    dataset_id: DATASET_ID, request_id: REQUEST_ID, reversal_id: REVERSAL_ID
+) -> dict:
+    return await ledger.get_reversal(dataset_id, request_id, reversal_id)
 
 
 # -------------------------------------------------------------- reservations
