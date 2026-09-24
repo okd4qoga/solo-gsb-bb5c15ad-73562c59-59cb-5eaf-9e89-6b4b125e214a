@@ -16,6 +16,7 @@ from .schemas import (
     MAX_EPSILON_CAP,
     ReservationConfirm,
     ReservationCreate,
+    ReversalCreate,
     utcnow,
 )
 
@@ -276,6 +277,10 @@ async def list_requests(dataset_id: str) -> dict[str, Any]:
                 "epsilon_before": r["epsilon_before"],
                 "epsilon_after": r["epsilon_after"],
                 "created_at": r["created_at"],
+                # The historical record is untouched; the reversal marker is
+                # joined in from the immutable reversals table.
+                "reversed": r["reversal_id"] is not None,
+                "reversal_id": r["reversal_id"],
             }
             for r in rows
         ],
@@ -887,3 +892,142 @@ async def transfer_budget(
 
             row = await db.get_budget_transfer(conn, payload.transfer_id)
             return _transfer_view_from_row(row, replay=False), 201
+
+
+# ------------------------------------------------------------- reversals ---
+
+
+def _reversal_view(
+    row: aiosqlite.Row, dataset: aiosqlite.Row, *, replay: bool
+) -> dict[str, Any]:
+    committed_after = row["epsilon_committed_after"]
+    return {
+        "reversal_id": row["reversal_id"],
+        "dataset_id": row["dataset_id"],
+        "request_id": row["request_id"],
+        "reason": row["reason"],
+        "epsilon": row["epsilon"],
+        "delta": row["delta"],
+        "epsilon_committed_before": row["epsilon_committed_before"],
+        "epsilon_committed_after": committed_after,
+        "epsilon_remaining": max(0.0, dataset["epsilon_cap"] - committed_after),
+        "idempotent_replay": replay,
+        "created_at": row["created_at"],
+    }
+
+
+async def reverse_request(
+    dataset_id: str, request_id: str, payload: ReversalCreate
+) -> tuple[dict[str, Any], int]:
+    """Immutably reverse a granted request, releasing its budget.
+
+    Only a ``granted`` request that has not been reversed yet can be
+    reversed; rejected requests and repeated reversals are refused with a
+    409-state conflict.  The original request row (and any confirmed
+    reservation behind it) is never modified: the reversal is stored as a
+    separate immutable record inside the same ``BEGIN IMMEDIATE``
+    transaction, and every RDP composition path (budget views, new
+    submissions, reservation confirmation, cap transfers, release forecasts)
+    excludes the reversed request from then on, while active reservations
+    keep counting.
+    """
+    now_iso = utcnow().isoformat()
+
+    async with _write_lock():
+        async with db.connect() as conn:
+            await db.begin_immediate(conn)
+            try:
+                dataset = await db.require_dataset(conn, dataset_id)
+
+                # Global idempotency: reversal_id may name at most one
+                # (dataset, request, reason) triple.
+                existing = await db.get_reversal(conn, payload.reversal_id)
+                if existing is not None:
+                    same = (
+                        existing["dataset_id"] == dataset_id
+                        and existing["request_id"] == request_id
+                        and existing["reason"] == payload.reason
+                    )
+                    if not same:
+                        raise db.ReversalConflict(payload.reversal_id)
+                    view = _reversal_view(existing, dataset, replay=True)
+                    await conn.commit()
+                    return view, 200
+
+                row = await db.get_request(conn, dataset_id, request_id)
+                if row is None:
+                    raise db.RequestNotFound(request_id)
+                if row["status"] != "granted":
+                    raise db.ReversalStateConflict(
+                        "request_rejected",
+                        "only granted requests can be reversed; request "
+                        f"{request_id!r} is {row['status']}",
+                    )
+                prior = await db.get_request_reversal(conn, dataset_id, request_id)
+                if prior is not None:
+                    raise db.ReversalStateConflict(
+                        "request_already_reversed",
+                        f"request {request_id!r} was already reversed by "
+                        f"reversal {prior['reversal_id']!r}",
+                    )
+
+                # Committed epsilon before/after the release, with the exact
+                # RDP accounting used everywhere else (the lazy reservation
+                # sweep runs inside this transaction too; active reservations
+                # stay in the composition on both sides).
+                entries = await _committed_entries(conn, dataset_id, now_iso)
+                _, committed_before, _ = rdp.evaluate_entries(
+                    entries, dataset["delta_cap"]
+                )
+                target = (row["epsilon"], row["delta"])
+                others = list(entries)
+                try:
+                    others.remove(target)
+                except ValueError:
+                    # Defensive: committed set and row state diverged.
+                    others = entries
+                _, committed_after, _ = rdp.evaluate_entries(
+                    others, dataset["delta_cap"]
+                )
+                committed_before = max(0.0, committed_before)
+                committed_after = max(0.0, committed_after)
+
+                await db.insert_reversal(
+                    conn,
+                    reversal_id=payload.reversal_id,
+                    dataset_id=dataset_id,
+                    request_id=request_id,
+                    reason=payload.reason,
+                    epsilon=row["epsilon"],
+                    delta=row["delta"],
+                    epsilon_committed_before=committed_before,
+                    epsilon_committed_after=committed_after,
+                    created_at=now_iso,
+                )
+                await conn.commit()
+            except Exception:
+                await conn.rollback()
+                raise
+
+            stored = await db.get_reversal(conn, payload.reversal_id)
+            return _reversal_view(stored, dataset, replay=False), 201
+
+
+async def get_reversal(dataset_id: str, reversal_id: str) -> dict[str, Any]:
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        row = await db.get_reversal(conn, reversal_id)
+        if row is None or row["dataset_id"] != dataset_id:
+            raise db.ReversalNotFound(reversal_id)
+        return _reversal_view(row, dataset, replay=False)
+
+
+async def list_reversals(dataset_id: str) -> dict[str, Any]:
+    async with db.connect() as conn:
+        dataset = await db.require_dataset(conn, dataset_id)
+        rows = await db.list_reversals(conn, dataset_id)
+    return {
+        "dataset_id": dataset_id,
+        "count": len(rows),
+        "reversals": [_reversal_view(r, dataset, replay=False) for r in rows],
+    }

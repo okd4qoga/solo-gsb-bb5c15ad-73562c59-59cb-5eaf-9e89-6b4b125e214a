@@ -123,10 +123,36 @@ CREATE TABLE IF NOT EXISTS budget_transfers (
 );
 """
 
+# Version 4: reversals of granted analysis requests.  A row is the immutable
+# audit record of one POST /datasets/{id}/requests/{id}/reversals call: the
+# original request row (and any confirmed reservation behind it) is never
+# modified — the reversal simply excludes the request from every RDP
+# composition path, releasing its budget.  ``reversal_id`` is a globally
+# unique idempotency key; ``UNIQUE (dataset_id, request_id)`` guarantees a
+# request can be reversed at most once, even under concurrent writers.
+SCHEMA_V4 = """
+CREATE TABLE IF NOT EXISTS reversals (
+    id                        INTEGER PRIMARY KEY AUTOINCREMENT,
+    reversal_id               TEXT NOT NULL UNIQUE,
+    dataset_id                TEXT NOT NULL REFERENCES datasets(dataset_id),
+    request_id                TEXT NOT NULL,
+    reason                    TEXT NOT NULL,
+    epsilon                   REAL NOT NULL,
+    delta                     REAL NOT NULL,
+    epsilon_committed_before  REAL NOT NULL,
+    epsilon_committed_after   REAL NOT NULL,
+    created_at                TEXT NOT NULL,
+    UNIQUE (dataset_id, request_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_reversals_dataset ON reversals (dataset_id, id);
+"""
+
 MIGRATIONS: dict[int, str] = {
     1: SCHEMA_V1,
     2: SCHEMA_V2,
     3: SCHEMA_V3,
+    4: SCHEMA_V4,
 }
 LATEST_VERSION = max(MIGRATIONS)
 
@@ -163,6 +189,25 @@ class ReservationStateConflict(Exception):
 
 class TransferConflict(Exception):
     """Same transfer_id reused with a different payload (HTTP 409)."""
+
+
+class RequestNotFound(Exception):
+    """Raised when a request_id is missing (HTTP 404)."""
+
+
+class ReversalNotFound(Exception):
+    """Raised when a reversal_id is missing (HTTP 404)."""
+
+
+class ReversalConflict(Exception):
+    """Same reversal_id reused with a different payload (HTTP 409)."""
+
+
+class ReversalStateConflict(Exception):
+    """Request cannot be reversed in its current state (HTTP 409).
+
+    ``args[0]`` carries an API error code, ``args[1]`` the human detail.
+    """
 
 
 # -------------------------------------------------------------- connection --
@@ -273,10 +318,20 @@ _RESERVATION_SELECT = (
 async def list_granted_entries(
     db: aiosqlite.Connection, dataset_id: str
 ) -> list[tuple[float, float]]:
-    """All granted mechanisms as ``(epsilon, delta)`` pairs, in grant order."""
+    """All budget-occupying granted mechanisms as ``(epsilon, delta)`` pairs.
+
+    Granted requests that have been reversed are excluded: a reversal releases
+    the request's budget everywhere (budget views, admissions, transfers and
+    forecasts share this query) without touching the immutable request row.
+    """
     async with db.execute(
         "SELECT epsilon, delta FROM requests "
-        "WHERE dataset_id = ? AND status = 'granted' ORDER BY id",
+        "WHERE dataset_id = ? AND status = 'granted' "
+        "AND NOT EXISTS ("
+        "    SELECT 1 FROM reversals "
+        "    WHERE reversals.dataset_id = requests.dataset_id "
+        "    AND reversals.request_id = requests.request_id"
+        ") ORDER BY id",
         (dataset_id,),
     ) as cur:
         rows = await cur.fetchall()
@@ -378,10 +433,16 @@ async def get_request(
 
 
 async def list_requests(db: aiosqlite.Connection, dataset_id: str) -> list[aiosqlite.Row]:
+    """All request rows, each annotated with its ``reversal_id`` (NULL if the
+    request was never reversed) so listings can mark reversed requests."""
     async with db.execute(
-        "SELECT dataset_id, request_id, query_type, epsilon, delta, status, "
-        "reason, epsilon_before, epsilon_after, rdp_best_order, created_at "
-        "FROM requests WHERE dataset_id = ? ORDER BY id",
+        "SELECT r.dataset_id, r.request_id, r.query_type, r.epsilon, r.delta, "
+        "r.status, r.reason, r.epsilon_before, r.epsilon_after, "
+        "r.rdp_best_order, r.created_at, rev.reversal_id AS reversal_id "
+        "FROM requests r "
+        "LEFT JOIN reversals rev "
+        "ON rev.dataset_id = r.dataset_id AND rev.request_id = r.request_id "
+        "WHERE r.dataset_id = ? ORDER BY r.id",
         (dataset_id,),
     ) as cur:
         return await cur.fetchall()
@@ -569,3 +630,70 @@ async def get_budget_transfer(
 ) -> Optional[aiosqlite.Row]:
     async with db.execute(_TRANSFER_SELECT, (transfer_id,)) as cur:
         return await cur.fetchone()
+
+
+# ---------------------------------------------------------------- reversals --
+
+
+async def insert_reversal(
+    db: aiosqlite.Connection,
+    *,
+    reversal_id: str,
+    dataset_id: str,
+    request_id: str,
+    reason: str,
+    epsilon: float,
+    delta: float,
+    epsilon_committed_before: float,
+    epsilon_committed_after: float,
+    created_at: str,
+) -> None:
+    """Insert the immutable reversal record inside the caller's transaction."""
+    await db.execute(
+        "INSERT INTO reversals "
+        "(reversal_id, dataset_id, request_id, reason, epsilon, delta, "
+        "epsilon_committed_before, epsilon_committed_after, created_at) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            reversal_id, dataset_id, request_id, reason, epsilon, delta,
+            epsilon_committed_before, epsilon_committed_after, created_at,
+        ),
+    )
+
+
+_REVERSAL_SELECT = (
+    "SELECT reversal_id, dataset_id, request_id, reason, epsilon, delta, "
+    "epsilon_committed_before, epsilon_committed_after, created_at "
+    "FROM reversals"
+)
+
+
+async def get_reversal(
+    db: aiosqlite.Connection, reversal_id: str
+) -> Optional[aiosqlite.Row]:
+    """Look up a reversal by its globally unique idempotency key."""
+    async with db.execute(
+        f"{_REVERSAL_SELECT} WHERE reversal_id = ?", (reversal_id,)
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def get_request_reversal(
+    db: aiosqlite.Connection, dataset_id: str, request_id: str
+) -> Optional[aiosqlite.Row]:
+    """The reversal of one request, if it has been reversed at all."""
+    async with db.execute(
+        f"{_REVERSAL_SELECT} WHERE dataset_id = ? AND request_id = ?",
+        (dataset_id, request_id),
+    ) as cur:
+        return await cur.fetchone()
+
+
+async def list_reversals(
+    db: aiosqlite.Connection, dataset_id: str
+) -> list[aiosqlite.Row]:
+    async with db.execute(
+        f"{_REVERSAL_SELECT} WHERE dataset_id = ? ORDER BY id",
+        (dataset_id,),
+    ) as cur:
+        return await cur.fetchall()

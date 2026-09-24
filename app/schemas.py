@@ -192,6 +192,10 @@ class RequestRecord(BaseModel):
     epsilon_before: float
     epsilon_after: float
     created_at: datetime
+    # Reversal marking: a reversed granted request keeps its original record
+    # (status stays "granted") but no longer occupies budget.
+    reversed: bool = False
+    reversal_id: Optional[str] = None
 
 
 class RequestList(BaseModel):
@@ -374,6 +378,74 @@ class BudgetTransferView(BaseModel):
     target: BudgetTransferSide
     idempotent_replay: bool = False
     created_at: datetime
+
+
+# ------------------------------------------------------------- reversals ---
+
+
+class ReversalCreate(BaseModel):
+    """Reverse a granted, not-yet-reversed analysis request.
+
+    The original request record is never modified; an immutable reversal
+    record is stored instead and the request stops occupying budget.
+    """
+
+    reversal_id: str = Field(
+        ...,
+        min_length=1,
+        max_length=200,
+        examples=["rev-20260924-0001"],
+        description="Client-generated idempotency key; globally unique.",
+    )
+    reason: str = Field(
+        ...,
+        min_length=1,
+        max_length=2000,
+        examples=["duplicate submission, budget returned"],
+        description="Free-form audit note explaining why the granted request "
+        "is reversed.",
+    )
+
+    @field_validator("reversal_id")
+    @classmethod
+    def _valid_id(cls, v: str) -> str:
+        if not _DATASET_ID_PATTERN.fullmatch(v):
+            raise ValueError(
+                "may contain only letters, digits, '.', '_' and '-'"
+            )
+        return v
+
+
+class ReversalView(BaseModel):
+    """One immutable reversal record.
+
+    ``epsilon_committed_before`` / ``epsilon_committed_after`` are the
+    composed RDP epsilon of granted (non-reversed) requests plus active
+    reservations immediately before / after the reversal was registered, so
+    the released capacity is auditable.  Replaying the same ``reversal_id``
+    with the same target and reason returns the stored record
+    (``idempotent_replay = true``) without reversing again.
+    """
+
+    reversal_id: str
+    dataset_id: str
+    request_id: str
+    reason: str
+    # (epsilon, delta) of the reversed request, i.e. what left the composition.
+    epsilon: float
+    delta: float
+    epsilon_committed_before: float
+    epsilon_committed_after: float
+    # cap - epsilon_committed_after, evaluated with the dataset's current cap.
+    epsilon_remaining: float
+    idempotent_replay: bool = False
+    created_at: datetime
+
+
+class ReversalList(BaseModel):
+    dataset_id: str
+    count: int
+    reversals: list[ReversalView]
 
 
 def utcnow() -> datetime:
